@@ -11,8 +11,6 @@ import random
 import torch
 from torch.utils.data import DataLoader
 
-from utils.distributed import any_broadcast
-
 
 class MetaLoader(object):
     """ wraps multiple data loaders """
@@ -42,9 +40,6 @@ class MetaLoader(object):
         while True:
             if self.step % self.accum_steps == 0:
                 task = random.choice(self.sampling_pools)
-                if self.distributed:
-                    # make sure all process is training same task
-                    task = any_broadcast(task, 0)
             self.step += 1
             iter_ = self.name2iter[task]
             try:

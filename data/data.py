@@ -13,7 +13,6 @@ from os.path import exists
 import numpy as np
 import torch
 from torch.utils.data import Dataset, ConcatDataset
-import horovod.torch as hvd
 from tqdm import tqdm
 import lmdb
 from lz4.frame import compress, decompress
@@ -37,12 +36,7 @@ def compute_num_bb(confs, conf_th, min_bb, max_bb):
 
 
 def _check_distributed():
-    try:
-        dist = hvd.size() != hvd.local_size()
-    except ValueError:
-        # not using horovod
-        dist = False
-    return dist
+    return False
 
 
 class DetectFeatLmdb(object):
@@ -113,16 +107,19 @@ class DetectFeatLmdb(object):
 
     def __getitem__(self, file_name):
         dump = self.txn.get(file_name.encode('utf-8'))
-        nbb = self.name2nbb[file_name]
-        if self.compress:
-            with io.BytesIO(dump) as reader:
-                img_dump = np.load(reader, allow_pickle=True)
-                img_dump = {'features': img_dump['features'],
-                            'norm_bb': img_dump['norm_bb']}
+        nbb = self.name2nbb.get(file_name, 0)
+        if nbb:
+            if self.compress:
+                with io.BytesIO(dump) as reader:
+                    img_dump = np.load(reader, allow_pickle=True)
+                    img_dump = {'features': img_dump['features'],
+                                'norm_bb': img_dump['norm_bb']}
+            else:
+                img_dump = msgpack.loads(dump, raw=False)
+            img_feat = torch.tensor(img_dump['features'][:nbb, :]).float()
+            img_bb = torch.tensor(img_dump['norm_bb'][:nbb, :]).float()
         else:
-            img_dump = msgpack.loads(dump, raw=False)
-        img_feat = torch.tensor(img_dump['features'][:nbb, :]).float()
-        img_bb = torch.tensor(img_dump['norm_bb'][:nbb, :]).float()
+             img_feat, img_bb = None, None
         return img_feat, img_bb
 
 
@@ -219,14 +216,14 @@ def get_ids_and_lens(db):
     assert isinstance(db, TxtTokLmdb)
     lens = []
     ids = []
-    for id_ in list(db.id2len.keys())[hvd.rank()::hvd.size()]:
+    for id_ in list(db.id2len.keys()):
         lens.append(db.id2len[id_])
         ids.append(id_)
     return lens, ids
 
 
 class DetectFeatTxtTokDataset(Dataset):
-    def __init__(self, txt_db, img_db):
+    def __init__(self, txt_db, img_db, *args, **kwargs):
         assert isinstance(txt_db, TxtTokLmdb)
         assert isinstance(img_db, DetectFeatLmdb)
         self.txt_db = txt_db
@@ -234,7 +231,7 @@ class DetectFeatTxtTokDataset(Dataset):
         txt_lens, self.ids = get_ids_and_lens(txt_db)
 
         txt2img = txt_db.txt2img
-        self.lens = [tl + self.img_db.name2nbb[txt2img[id_]]
+        self.lens = [tl + self.img_db.name2nbb.get(txt2img[id_], 0)
                      for tl, id_ in zip(txt_lens, self.ids)]
 
     def __len__(self):
@@ -247,6 +244,9 @@ class DetectFeatTxtTokDataset(Dataset):
 
     def _get_img_feat(self, fname):
         img_feat, bb = self.img_db[fname]
+        if bb is None:
+            print(fname)
+            return img_feat, bb, 0
         img_bb = torch.cat([bb, bb[:, 4:5]*bb[:, 5:]], dim=-1)
         num_bb = img_feat.size(0)
         return img_feat, img_bb, num_bb

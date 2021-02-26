@@ -8,7 +8,7 @@ NOTE: loggers are global objects use with caution
 import logging
 import math
 
-import tensorboardX
+import tensorboard
 
 
 _LOG_FMT = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s'
@@ -30,7 +30,7 @@ class TensorboardLogger(object):
         self._global_step = 0
 
     def create(self, path):
-        self._logger = tensorboardX.SummaryWriter(path)
+        self._logger = tensorboard.SummaryWriter(path)
 
     def noop(self, *args, **kwargs):
         return

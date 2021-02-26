@@ -16,7 +16,8 @@ def _get_vqa_target(example, num_answers):
     labels = example['target']['labels']
     scores = example['target']['scores']
     if labels and scores:
-        target.scatter_(0, torch.tensor(labels), torch.tensor(scores))
+        labels = [int(l) for l in labels]
+        target.scatter_(0, torch.tensor(labels, dtype=torch.long), torch.tensor(scores, dtype=torch.float))
     return target
 
 

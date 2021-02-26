@@ -17,7 +17,6 @@ from torch.utils.data import DataLoader
 from torch.optim import Adam, Adamax
 
 from apex import amp
-from horovod import torch as hvd
 
 from tqdm import tqdm
 
@@ -29,10 +28,8 @@ from model.vqa import UniterForVisualQuestionAnswering
 from optim import AdamW, get_lr_sched
 
 from utils.logger import LOGGER, TB_LOGGER, RunningMeter, add_log_to_file
-from utils.distributed import (all_reduce_and_rescale_tensors, all_gather_list,
-                               broadcast_tensors)
 from utils.save import ModelSaver, save_training_meta
-from utils.misc import NoOp, parse_with_config, set_dropout, set_random_seed
+from utils.misc import parse_with_config, set_dropout, set_random_seed
 from utils.const import BUCKET_SIZE, IMG_DIM
 
 
@@ -87,16 +84,7 @@ def build_optimizer(model, opts):
 
 
 def main(opts):
-    hvd.init()
-    n_gpu = hvd.size()
-    device = torch.device("cuda", hvd.local_rank())
-    torch.cuda.set_device(hvd.local_rank())
-    rank = hvd.rank()
-    opts.rank = rank
-    LOGGER.info("device: {} n_gpu: {}, rank: {}, "
-                "16-bits training: {}".format(
-                    device, n_gpu, hvd.rank(), opts.fp16))
-
+    n_gpu = torch.cuda.device_count()
     if opts.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, "
                          "should be >= 1".format(
@@ -142,32 +130,26 @@ def main(opts):
     model = UniterForVisualQuestionAnswering.from_pretrained(
         opts.model_config, checkpoint,
         img_dim=IMG_DIM, num_answer=len(ans2label))
-    model.to(device)
+    model.to('cuda')
     # make sure every process has same model parameters in the beginning
-    broadcast_tensors([p.data for p in model.parameters()], 0)
     set_dropout(model, opts.dropout)
 
     # Prepare optimizer
     optimizer = build_optimizer(model, opts)
     model, optimizer = amp.initialize(model, optimizer,
                                       enabled=opts.fp16, opt_level='O2')
+    model = torch.nn.DataParallel(model)
     global_step = 0
-    if rank == 0:
-        save_training_meta(opts)
-        TB_LOGGER.create(join(opts.output_dir, 'log'))
-        pbar = tqdm(total=opts.num_train_steps)
-        model_saver = ModelSaver(join(opts.output_dir, 'ckpt'))
-        json.dump(ans2label,
-                  open(join(opts.output_dir, 'ckpt', 'ans2label.json'), 'w'))
-        os.makedirs(join(opts.output_dir, 'results'))  # store VQA predictions
-        add_log_to_file(join(opts.output_dir, 'log', 'log.txt'))
-    else:
-        LOGGER.disabled = True
-        pbar = NoOp()
-        model_saver = NoOp()
+    save_training_meta(opts)
+    TB_LOGGER.create(join(opts.output_dir, 'log'))
+    pbar = tqdm(total=opts.num_train_steps)
+    model_saver = ModelSaver(join(opts.output_dir, 'ckpt'))
+    json.dump(ans2label, open(join(opts.output_dir, 'ckpt', 'ans2label.json'), 'w'))
+    os.makedirs(join(opts.output_dir, 'results'))  # store VQA predictions
+    add_log_to_file(join(opts.output_dir, 'log', 'log.txt'))
 
     LOGGER.info(f"***** Running training with {n_gpu} GPUs *****")
-    LOGGER.info("  Num examples = %d", len(train_dataset) * hvd.size())
+    LOGGER.info("  Num examples = %d", len(train_dataset))
     LOGGER.info("  Batch size = %d", opts.train_batch_size)
     LOGGER.info("  Accumulate steps = %d", opts.gradient_accumulation_steps)
     LOGGER.info("  Num steps = %d", opts.num_train_steps)
@@ -196,7 +178,6 @@ def main(opts):
                     # the same gradient scale
                     grads = [p.grad.data for p in model.parameters()
                              if p.requires_grad and p.grad is not None]
-                    all_reduce_and_rescale_tensors(grads, float(1))
 
             running_loss(loss.item())
 
@@ -231,7 +212,7 @@ def main(opts):
                 if global_step % 100 == 0:
                     # monitor training throughput
                     LOGGER.info(f'============Step {global_step}=============')
-                    tot_ex = sum(all_gather_list(n_examples))
+                    tot_ex = n_examples
                     ex_per_sec = int(tot_ex / (time()-start))
                     LOGGER.info(f'{tot_ex} examples trained at '
                                 f'{ex_per_sec} ex/s')
@@ -286,9 +267,6 @@ def validate(model, val_loader, label2ans):
         for qid, answer in zip(batch['qids'], answers):
             results[qid] = answer
         n_ex += len(batch['qids'])
-    val_loss = sum(all_gather_list(val_loss))
-    tot_score = sum(all_gather_list(tot_score))
-    n_ex = sum(all_gather_list(n_ex))
     tot_time = time()-st
     val_loss /= n_ex
     val_acc = tot_score / n_ex
